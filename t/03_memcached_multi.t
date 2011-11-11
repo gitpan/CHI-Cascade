@@ -13,17 +13,33 @@ use constant DELAY	=> 2.0;
 plan skip_all => 'Not installed CHI::Driver::Memcached::Fast'
   unless eval "use CHI::Driver::Memcached::Fast; 1";
 
-my $cwd;
+my ($pid_file, $socket_file, $cwd, $user_opt);
+
 chomp($cwd = `pwd`);
 
-my $out = `memcached -d -s $cwd/t/memcached.socket -a 644 -m 64 -c 10 -P $cwd/t/memcached.pid -t 2 2>&1`;
+if ($< == 0) {
+    # if root - other options
+    $pid_file 		= "/tmp/memcached.$$.pid";
+    $socket_file	= "/tmp/memcached.$$.socket";
+    $user_opt		= '-u nobody';
 
-if ($?) {
+}
+else {
+    $pid_file 		= "$cwd/t/memcached.$$.pid";
+    $socket_file	= "$cwd/t/memcached.$$.socket";
+    $user_opt		= '';
+}
+
+my $out = `memcached $user_opt -d -s $socket_file -a 644 -m 64 -c 10 -P $pid_file -t 2 2>&1`;
+
+sleep 1;
+
+if ( $? || ! (-f $pid_file )) {
     chomp $out;
     plan skip_all => "Cannot start the memcached for this test ($out)";
 }
 
-my ($pid_slow, $pid_quick);
+my ($pid_slow, $pid_quick, $big_array_type);
 
 setup_for_slow_process();
 
@@ -50,25 +66,27 @@ else {
 # Here parent - it will command
 
 $SIG{__DIE__} = sub {
-    `{ kill \`cat t/memcached.pid\`; rm -f t/memcached.pid; rm -f t/memcached.socket; } >/dev/null 2>&1`;
+    `{ kill \`cat $pid_file\`; } >/dev/null 2>&1`;
     kill 15, $pid_slow if $pid_slow;
     kill 15, $pid_quick if $pid_quick;
     waitpid($pid_slow, 0);
     waitpid($pid_quick, 0);
+    unlink $pid_file	unless -l $pid_file;
+    unlink $socket_file	unless -l $socket_file;
     $SIG{__DIE__} = 'IGNORE';
 };
 
 $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { die "Terminated by " . shift };
 $SIG{ALRM} = sub { die "Alarmed!" };
 
-alarm( DELAY * 2 + 2 );
+alarm( DELAY * 4 + 1 );
 
 start_parent_commanding();
 
 exit 0;
 
 sub start_parent_commanding {
-    plan tests => 5;
+    plan tests => 12;
 
     my $in;
 
@@ -88,6 +106,28 @@ sub start_parent_commanding {
     ok(	defined($in->{value}), 'value of save1 defined' );
     is_deeply( $in->{value}, [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ], 'value of save1' );
 
+    print CHILD_SLOW_WTR "save2\n"		or die $!;
+
+    sleep 0.1;
+
+    print CHILD_QUICK_WTR "read1\n"		or die $!;
+    $in = fd_retrieve(\*CHILD_QUICK_RDR)	or die "fd_retrieve";
+
+    ok( $in->{time2} - $in->{time1} < 0.1, 'time of read1(2)' );
+    is_deeply( $in->{value}, [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ], 'value of save2 before' );
+
+    $in = fd_retrieve(\*CHILD_SLOW_RDR);
+
+    ok(	abs( DELAY * 2 - $in->{time2} + $in->{time1} ) < 0.1, 'time of save2' );
+    ok(	defined($in->{value}), 'value of save2 defined' );
+    is_deeply( $in->{value}, [ 101, 102, 103, 104, 105, 106, 107, 108, 109, 110 ], 'value of save2' );
+
+    print CHILD_QUICK_WTR "read1\n"		or die $!;
+    $in = fd_retrieve(\*CHILD_QUICK_RDR)	or die "fd_retrieve";
+
+    ok( $in->{time2} - $in->{time1} < 0.1, 'time of read1(3)' );
+    is_deeply( $in->{value}, [ 101, 102, 103, 104, 105, 106, 107, 108, 109, 110 ], 'value of save2 after' );
+
     print CHILD_SLOW_WTR "exit\n"		or die $!;
     print CHILD_QUICK_WTR "exit\n"		or die $!;
 
@@ -100,7 +140,7 @@ sub run_slow_process {
     my $cascade = CHI::Cascade->new(
 	chi => CHI->new(
 	    driver		=> 'Memcached::Fast',
-	    servers		=> ['t/memcached.socket'],
+	    servers		=> [$socket_file],
 	    namespace		=> 'CHI::Cascade::tests'
 	)
     );
@@ -120,6 +160,17 @@ sub run_slow_process {
 	    $out->{time2} = time;
 	    store_fd $out, \*PARENT_SLOW_WTR;
 	}
+	elsif ($line eq 'save2') {
+	    $out = {};
+
+	    $big_array_type = 1;
+	    $cascade->touch('big_array_trigger');
+
+	    $out->{time1} = time;
+	    $out->{value} = $cascade->run('one_page_0');
+	    $out->{time2} = time;
+	    store_fd $out, \*PARENT_SLOW_WTR;
+	}
 	elsif ($line eq 'exit') {
 	    exit 0;
 	}
@@ -132,7 +183,7 @@ sub run_quick_process {
     my $cascade = CHI::Cascade->new(
 	chi => CHI->new(
 	    driver		=> 'Memcached::Fast',
-	    servers		=> ['t/memcached.socket'],
+	    servers		=> [$socket_file],
 	    namespace		=> 'CHI::Cascade::tests'
 	)
     );
@@ -157,8 +208,6 @@ sub run_quick_process {
 	}
     }
 }
-
-
 
 sub setup_for_slow_process {
     pipe(PARENT_SLOW_RDR, CHILD_SLOW_WTR);
@@ -194,10 +243,18 @@ sub set_cascade_rules {
     my ($cascade, $delay) = @_;
 
     $cascade->rule(
+	target		=> 'big_array_trigger',
+	code		=> sub {
+	    return [];
+	}
+    );
+
+    $cascade->rule(
 	target		=> 'big_array',
+	depends		=> 'big_array_trigger',
 	code		=> sub {
 	    sleep $delay;
-	    return [ 1 .. 1000 ];
+	    return $big_array_type ? [ 101 .. 1000 ] : [ 1 .. 1000 ];
 	}
     );
 
