@@ -3,7 +3,7 @@ package CHI::Cascade;
 use strict;
 use warnings;
 
-our $VERSION = 0.12;
+our $VERSION = 0.13;
 
 use Carp;
 
@@ -98,6 +98,12 @@ sub target_unlock {
     }
 }
 
+sub target_remove {
+    my ($self, $target) = @_;
+
+    $self->{chi}->remove("t:$target");
+}
+
 sub touch {
     my ($self, $target) = @_;
 
@@ -119,13 +125,14 @@ sub recompute {
     $self->{stats}{recompute}++;
 
     if ($@) {
-	die "CHI::Cascade: the target $target - error in the code: $@";
+	my $error = $@;
+	die( (eval { $error->isa('CHI::Cascade::Value') }) ? $error : "CHI::Cascade: the target $target - error in the code: $error" );
     }
 
     my $value;
 
     $self->{chi}->set( "v:$target", $value = CHI::Cascade::Value->new->value($ret), 'never' );
-    $value->recomputed(1);
+    return $value->recomputed(1);
 }
 
 sub value_ref_if_recomputed {
@@ -180,8 +187,11 @@ sub value_ref_if_recomputed {
 	    # So we should recompute values for other dependencies
 	    foreach $dep_target (keys %dep_values) {
 		if ( ! $dep_values{$dep_target}->[1]->is_value ) {
-		    return undef
-		      unless ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target, 1 ) )->is_value;
+		    if ( ! ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target, 1 ) )->is_value ) {
+			warn "assertion: value of dependence '$dep_target' should be in cache but none there";
+			$self->target_remove($dep_target);
+			return undef;
+		    }
 		}
 	    }
 	}
@@ -213,7 +223,13 @@ sub run {
 
 	my $value = $self->value_ref_if_recomputed( $self->find($target), $target );
 
-	return $self->get_value( $target ) unless ($value->is_value);
+	if ( ! $value->is_value ) {
+	    $value = $self->get_value( $target );
+	    if ( ! $value->is_value ) {
+		$self->target_remove($target);
+		warn "assertion: value for target '$target' should be in cache but none there";
+	    }
+	}
 	return $value;
     };
 
