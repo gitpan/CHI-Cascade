@@ -3,7 +3,7 @@ package CHI::Cascade;
 use strict;
 use warnings;
 
-our $VERSION = 0.14;
+our $VERSION = 0.15;
 
 use Carp;
 
@@ -373,25 +373,49 @@ The keys of %options are:
 
 =item target
 
-A target for L</run> and for searching of L</depends>. It can be as scalar text
-or C<Regexp> object created through C<qr//>
+B<Required.> A target for L</run> and for searching of L</depends>. It can be as
+scalar text or C<Regexp> object created through C<qr//>
 
 =item depends
 
-The list or a scalar value of dependencies - the list of targets which
-the current rule is dependent. Each item can be scalar value (exactly matched
-target) or code reference which will be executed during matching of target.
-A code subroutine will get a parameters from C<=~> operator against C<target>
-matching by C<qr//> operator(not tested while) - please see the section
-L</EXAMPLE> for this example.
+B<Optional.> The B<scalar>, B<arrayref> or B<coderef> values of dependencies.
+This is the definition of target(s) from which this current rule is dependent.
+If I<depends> is:
+
+=over
+
+=item scalar
+
+It should be plain text of single dependence of this target.
+
+=item arrayref
+
+An each item of list can be scalar value (exactly matched target) or code
+reference. A subroutine should return a scalar value as current dependence for
+this target at runtime. It will get a parameters from C<=~> operator against
+C<target> matching from C<qr//> operator if target is C<Regexp> object type -
+please see the section L</EXAMPLE> for this example.
+
+=item coderef
+
+This subroutine will be executed every time inside I<run> method if necessary.
+It will get a parameters from C<=~> operator against C<target> matching from
+C<qr//> operator if target is C<Regexp> object type. It should return B<scalar>
+or B<arrayref>. The returned value is I<scalar> it will be considered as single
+dependence of this target and the behavior will be exactly as described for
+I<scalar> in this paragraph. If the returned value is I<arrayref> it will be
+considered as list of dependencies for this target and the behavior will be
+exactly as described for I<arrayref> in this paragraph.
+
+=back
 
 =item code
 
-The code reference for computing a value of this target. Will be executed if no
-value in cache for this target or any dependence or dependences of dependences
-and so on will be recomputed. Will be executed as $code->( $rule, $target,
-$hashref_to_value_of_dependencies ) I<(The API of running this code was changed
-since v0.10)>
+B<Required.> The code reference for computing a value of this target. Will be
+executed if no value in cache for this target or any dependence or dependences
+of dependences and so on will be recomputed. Will be executed as $code->( $rule,
+$target, $hashref_to_value_of_dependencies ) I<(The API of running this code was
+changed since v0.10)>
 
 =over
 
@@ -456,7 +480,7 @@ appropriate ones.
 This module is experimental and not finished for new features ;-)
 Please send me issues through L<https://github.com/Perlover/CHI-Cascade> page
 
-=head1 CHI::Cascade & make
+=head1 ANALOGIES WITH make
 
 Here simple example how it works. Here is a direct analogy to Unix make
 utility:
