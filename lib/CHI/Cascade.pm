@@ -3,7 +3,7 @@ package CHI::Cascade;
 use strict;
 use warnings;
 
-our $VERSION = 0.19;
+our $VERSION = 0.20;
 
 use Carp;
 
@@ -74,7 +74,9 @@ sub target_lock {
 
     my ($trg_obj, $target);
 
-    $target = $rule->target;
+    # If target is already locked - a return
+    return
+      if ( $self->target_locked( $target = $rule->target ) );
 
     $trg_obj = CHI::Cascade::Target->new unless ( ( $trg_obj = $self->{chi}->get("t:$target") ) );
 
@@ -126,7 +128,7 @@ sub recompute {
 
     if ($@) {
 	my $error = $@;
-	die( (eval { $error->isa('CHI::Cascade::Value') }) ? $error : "CHI::Cascade: the target $target - error in the code: $error" );
+	die( ( eval { $error->isa('CHI::Cascade::Value') } ) ? $error->thrown_from_code(1) : "CHI::Cascade: the target $target - error in the code: $error" );
     }
 
     my $value;
@@ -167,6 +169,26 @@ sub value_ref_if_recomputed {
     my $ret = eval {
 	my $dep_target;
 
+	my $catcher =  sub {
+	    my $sub = shift;
+
+	    my $ret = eval { $sub->() };
+
+	    if ($@) {
+		my $exception = $@;
+
+		$rule->{depends_catch}->( $rule, $exception, $dep_values{$dep_target}->[0], $dep_target )
+		  if (   exists $rule->{depends_catch}
+		      && ref $rule->{depends_catch} eq 'CODE'
+		      && eval { $exception->isa('CHI::Cascade::Value') }
+		      && $exception->thrown_from_code );
+
+		die $exception;
+	    }
+
+	    return $ret;
+	};
+
 	foreach my $depend (@{ $rule->depends }) {
 	    $dep_target = ref($depend) eq 'CODE' ? $depend->( $rule, @qr_params ) : $depend;
 
@@ -175,10 +197,12 @@ sub value_ref_if_recomputed {
 	    die qq{Found a circled rule (target '$dep_target' as dependence of '$target')"}
 	      if ( ! $only_from_cache && exists $self->{chain}{$dep_target} );
 
-	    $self->target_lock($rule)
-	      if (   ! $only_from_cache
-		  && ( ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target ) )->recomputed
-		  || ( $self->target_time($dep_target) > $self->target_time($target) ) ) );
+	    $catcher->( sub {
+		$self->target_lock($rule)
+		  if (   ! $only_from_cache
+		      && ( ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target ) )->recomputed
+		      || ( $self->target_time($dep_target) > $self->target_time($target) ) ) );
+	    } );
 	}
 
 	$self->target_lock($rule) if ! $self->target_time($target);
@@ -190,11 +214,14 @@ sub value_ref_if_recomputed {
 		if (   ! defined $dep_values{$dep_target}->[1]
 		    || ! $dep_values{$dep_target}->[1]->is_value )
 		{
-		    if ( ! ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target, 1 ) )->is_value ) {
-			# warn "assertion: value of dependence '$dep_target' should be in cache but none there";
-			$self->target_remove($dep_target);
-			return undef;
-		    }
+		    $catcher->( sub {
+			if ( ! ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target, 1 ) )->is_value ) {
+			    # warn "assertion: value of dependence '$dep_target' should be in cache but none there";
+			    $self->target_remove($dep_target);
+			    return 1;
+			}
+			return 0;
+		    } ) == 1 && return undef;
 		}
 	    }
 	}
@@ -394,7 +421,7 @@ It should be plain text of single dependence of this target.
 
 An each item of list can be scalar value (exactly matched target) or code
 reference. If item is coderef it will be executed as $coderef->( $rule,
-L<$rule-E<gt>qr_params|CHI::Cascade::Rule/qr_params> ) and should return a
+L<< $rule->qr_params|CHI::Cascade::Rule/qr_params >> ) and should return a
 scalar value as current dependence for this target at runtime (the API for
 coderef parameters was changed since v0.16)
 
@@ -402,7 +429,7 @@ coderef parameters was changed since v0.16)
 
 This subroutine will be executed every time inside I<run> method if necessary
 and with parameters as: $coderef->( $rule,
-L<$rule-E<gt>qr_params|CHI::Cascade::Rule/qr_params> ) (API was changed since
+L<< $rule->qr_params|CHI::Cascade::Rule/qr_params >> ) (API was changed since
 v0.16). It should return B<scalar> or B<arrayref>. The returned value is
 I<scalar> it will be considered as single dependence of this target and the
 behavior will be exactly as described for I<scalar> in this paragraph. If the
@@ -412,6 +439,44 @@ this paragraph.
 
 =back
 
+=item depends_catch
+
+B<Optional.> This is B<coderef> for dependence exceptions. If any dependence
+from list of L</depends>'s option throws an exception of type
+CHI::Cascade::Value by C<die> (for example like this code: C<< die
+CHI::Cascade::Value->new->value( { i_have_problem => 1 } ) >> ) then the
+C<$cascade> will execute this code as C<< $rule->{depends_catch}->(
+$this_rule_obj, $exception_of_dependence, $rule_obj_of_dependence,
+$plain_text_target_of_dependence ) >> and you can do into inside a following:
+
+=over
+
+=item re-C<die> new exception of any type
+
+If your new exception will be type of L<CHI::Cascade::Value> you will get the
+value of this object from L</run> method immediately (please to see L</code>
+below) without saving in cache.
+
+If exception will be other type this will be propogated onward beyond the
+L</run> method
+
+=item to do something
+
+You can make something in this code. After execution of your code the cascade
+re-throws original exception of dependence like described above in L<<
+/"re-C<die>" >> section.
+
+But please notice that original exception has a status of "thrown from code" so
+it can be catched later by other L</depends_catch> callback from other rule
+located closer to the call hierarchy of L</run>.
+
+=back
+
+Please notice that there no way to continue a L</code> of current rule if any
+dependence throws an exception!. It because that the main concept of execution
+code of rules is to have all valid values (cached or recomputed) of all
+dependencies before execution of dependent code.
+
 =item code
 
 B<Required.> The code reference for computing a value of this target (a
@@ -420,11 +485,11 @@ any dependence or dependences of dependences and so on will be recomputed. Will
 be executed as C<< $code->( $rule, $target, $hashref_to_value_of_dependencies )
 >> I<(The API of running this code was changed since v0.10)>
 
-If you want to terminate a code and to return immediately from L<run> method and
-don't want to save a value in cache you can throw an exception from L<code> of
+If you want to terminate a code and to return immediately from L</run> method and
+don't want to save a value in cache you can throw an exception from L</code> of
 type L<CHI::Cascade::Value>. Your instance of L<CHI::Cascade::Value> can have a
-value or cannot (a valid value can be even C<undef>!). A L<run> method returns
-either a value is set by you (through L<CHI::Cascade::Value::value> method) or
+value or cannot (a valid value can be even C<undef>!). A L</run> method returns
+either a value is set by you (through L<CHI::Cascade::Value/value> method) or
 value from cache or C<undef> in other cases. Please to see
 L<CHI::Cascade::Value>
 
@@ -438,13 +503,13 @@ parameters and so on). Please to see L<CHI::Cascade::Rule>
 
 =item $target
 
-A current target as plain text (what a target the $cascade got from L<run>
-method)
+The current executed target as plain text for this L</code>
 
 =item $hashref_to_value_of_dependencies
 
-A hash reference of values of all dependencies for current target. Keys in this
-hash are flat strings of dependecies and values are computed or cached ones.
+A hash reference of values (values are cleaned values not L<CHI::Cascade::Value>
+objects!) of all dependencies for current target. Keys in this hash are flat
+strings of dependecies and values are computed or cached ones.
 
 This module should guarantee that values of dependencies will be valid values
 even if value is C<undef>. This code can return C<undef> value as a valid code
@@ -457,7 +522,7 @@ last will not be executed (The C<run> will return C<undef>).
 =item params
 
 You can pass in your code any additional parameters by this option. These
-parameters are accessed in your code through L<params|CHI::Cascade::Rule/params>
+parameters are accessed in your code through L<CHI::Cascade::Rule/params>
 method of L<CHI::Cascade::Rule> instance object.
 
 =item busy_lock
@@ -501,14 +566,15 @@ target's value has been changed and is already in cache.
 
 =item run( $target )
 
-This method makes a cascade computing if need and returns value for this target
-If any dependence of this target of any dependencies of dependencies were
-recomputed this target will be recomputed too.
+This method makes a cascade computing if need and returns value (value is
+cleaned value not L<CHI::Cascade::Value> object!) for this target If any
+dependence of this target of any dependencies of dependencies were recomputed
+this target will be recomputed too.
 
 =item touch( $target )
 
 This method refreshes the time of this target. Here is analogy with L<touch>
-utility of Unix and behaviour as L<make> after it. After L</touch> all targets
+utility of Unix and behaviour as L<make(1)> after it. After L</touch> all targets
 are dependent from this target will be recomputed at next L</run> with an
 appropriate ones.
 

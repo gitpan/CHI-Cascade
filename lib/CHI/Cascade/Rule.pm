@@ -14,9 +14,9 @@ sub new {
 
     # To do clone or new object
     my $self = bless {
-	map({ $_ => $from->{$_}}
+	map( { $_ => $from->{$_} }
 	  grep { exists $from->{$_} }
-	  qw( target depends code params busy_lock cascade recomputed )),
+	  qw( target depends depends_catch code params busy_lock cascade recomputed )),
 	qr_params	=> [],
 	matched_target	=> undef
     }, ref($class) || $class;
@@ -83,15 +83,15 @@ CHI::Cascade::Rule - a rule class
 
 =head1 CONSTRUCTOR
 
-An instance of this object is created by L<CHI::Cascade> in L<rule
-method|CHI::Cascade/rule>.
+An instance of this object is created by L<CHI::Cascade> in L<CHI::Cascade/rule>.
 
 =head1 DESCRIPTION
 
-The instance of this object is passed to L<your code|CHI::Cascade/code>,
-L<dependencies coderefs|CHI::Cascade/coderef> by L<CHI::Cascade> as first
-argument I<(The API of running this code was changed since v0.16)> You can use
-it object as accessor to some parameters of your currect executed target.
+The instance of this object is passed to L<CHI::Cascade/code>,
+L<CHI::Cascade/coderef>, L<CHI::Cascade/recomputed>,
+L<CHI::Cascade/depends_catch> by L<CHI::Cascade> as first argument I<(The API of
+running this code was changed since v0.16)>. You can use it object as accessor
+to some parameters of your currect executed target.
 
 =head1 METHODS
 
@@ -116,7 +116,7 @@ returns current target as plain text after matching.
 
 =item params
 
-returns any data of any type what were passed to L<params|CHI::Cascade/params>
+returns any data of any type what were passed to L<CHI::Cascade/params>
 
 =item cascade
 
