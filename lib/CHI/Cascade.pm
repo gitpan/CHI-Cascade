@@ -3,11 +3,11 @@ package CHI::Cascade;
 use strict;
 use warnings;
 
-our $VERSION = 0.221;
+our $VERSION = 0.23;
 
 use Carp;
 
-use CHI::Cascade::Value;
+use CHI::Cascade::Value ':bits';
 use CHI::Cascade::Rule;
 use CHI::Cascade::Target;
 
@@ -24,6 +24,7 @@ sub new {
 	}, ref($class) || $class;
 
     $self->{target_chi} ||= $self->{chi};
+    $self->{queue_chi}  ||= $self->{target_chi};
 
     $self;
 }
@@ -45,11 +46,11 @@ sub rule {
     }
 }
 
-sub target_computing {
+sub target_computing_or_queued {
     my $trg_obj;
 
     ($trg_obj = $_[0]->{target_chi}->get("t:$_[1]"))
-      ? $trg_obj->locked
+      ? ( $trg_obj->locked ? 1 : ( $_[0]->{queue_name} && $trg_obj->queued && 2 ) )
       : 0;
 }
 
@@ -67,8 +68,11 @@ sub target_time {
 sub get_value {
     my ($self, $target) = @_;
 
-    $self->{chi}->get("v:$target")
-      or CHI::Cascade::Value->new;
+    my $value = $self->{chi}->get("v:$target");
+
+    return $value->bits( CASCADE_FROM_CACHE ) if ($value);
+
+    CHI::Cascade::Value->new( bits => CASCADE_NO_CACHE );
 }
 
 sub target_lock {
@@ -121,8 +125,62 @@ sub target_locked {
     exists $_[0]->{target_locks}{$_[1]};
 }
 
+sub target_queue {
+    my $self = shift;
+
+    my $trg_obj;
+
+    $trg_obj = CHI::Cascade::Target->new unless $trg_obj = $self->{target_chi}->get("t:$self->{orig_target}");
+    $trg_obj->be_queued;
+    $self->{target_chi}->set( "t:$self->{orig_target}", $trg_obj, $trg_obj->locked ? $self->{orig_rule}{busy_lock} || $self->{busy_lock} || 'never' : 'never' );
+
+    my $queue;
+
+    $queue = [] unless $queue = $self->{queue_chi}->get("q:$self->{queue_name}");
+    push @$queue, $self->{orig_target};
+    $self->{queue_chi}->set( "q:$self->{queue_name}", $queue, 'never' );
+}
+
+sub target_not_queued {
+    my ( $self, $target ) = @_;
+
+    my $trg_obj;
+
+    if ( $trg_obj = $self->{target_chi}->get("t:$target") ) {
+	$trg_obj->not_queued;
+        $self->{target_chi}->set( "t:$target", $trg_obj, 'never' );
+    }
+}
+
+sub queue {
+    my ( $self, $queue_name ) = @_;
+
+    my ( $queue, $run_target );
+
+    if ( ( $queue = $self->{queue_chi}->get("q:$queue_name") ) && @$queue ) {
+	eval { $self->run( $run_target = $queue->[0] ) };
+
+	my $error = $@;
+
+	$self->target_not_queued( $queue->[0] );
+	$self->{queue_chi}->set( "q:$queue_name", $queue, 'never' )
+	  if ( ( $queue = $self->{queue_chi}->get("q:$queue_name") ) && $queue->[0] eq $run_target && shift @$queue );
+
+	die $error if $error;
+	return 1;
+    }
+
+    return 0;
+}
+
 sub recompute {
     my ( $self, $rule, $target, $dep_values) = @_;
+
+    if ( $self->{queue_name} ) {
+	# If run methos was run with 'queue' option - to prevent here any recomputing
+	$self->target_queue;
+	die CHI::Cascade::Value->new;
+    }
 
     my $ret = eval { $rule->{code}->( $rule, $target, $rule->{dep_values} = $dep_values ) };
 
@@ -136,8 +194,10 @@ sub recompute {
     my $value;
 
     $self->{chi}->set( "v:$target", $value = CHI::Cascade::Value->new->value($ret), 'never' );
+    $value->recomputed(1)->bits( CASCADE_ACTUAL_VALUE | CASCADE_RECOMPUTED );
     $rule->{recomputed}->( $rule, $target, $value ) if ( ref $rule->{recomputed} eq 'CODE' );
-    return $value->recomputed(1);
+
+    return $value;
 }
 
 sub value_ref_if_recomputed {
@@ -147,10 +207,10 @@ sub value_ref_if_recomputed {
 
     my @qr_params = $rule->qr_params;
 
-    if ( $self->target_computing($target) ) {
-	# If we have any target as a being computed (dependencie/original)
+    if ( my $ret = $self->target_computing_or_queued($target) ) {
+	# If we have any target as a being computed (dependencie/original) or queued if need
 	# there is no need to compute anything - trying to return original target value
-	die CHI::Cascade::Value->new;
+	die CHI::Cascade::Value->new->bits( $ret == 1 ? CASCADE_COMPUTING : CASCADE_QUEUED );
     }
 
     my ( %dep_values, $dep_name );
@@ -218,7 +278,6 @@ sub value_ref_if_recomputed {
 		{
 		    $catcher->( sub {
 			if ( ! ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target, 1 ) )->is_value ) {
-			    # warn "assertion: value of dependence '$dep_target' should be in cache but none there";
 			    $self->target_remove($dep_target);
 			    return 1;
 			}
@@ -231,7 +290,7 @@ sub value_ref_if_recomputed {
 	return $self->recompute( $rule, $target, { map { $_ => $dep_values{$_}->[1]->value } keys %dep_values } )
 	  if $self->target_locked($target);
 
-	return undef;
+	return CHI::Cascade::Value->new( bits => CASCADE_ACTUAL_VALUE );
     };
 
     my $e = $@;
@@ -243,18 +302,25 @@ sub value_ref_if_recomputed {
 }
 
 sub run {
-    my ($self, $target) = @_;
+    my $self = shift;
+
+    return $self->_run( 0, @_ )->value;
+}
+
+sub _run {
+    my ( $self, $only_from_cache, $target, %opts ) = @_;
 
     croak qq{The target ($target) for run should be string} if ref($target);
     croak qq{The target for run is empty} if $target eq '';
 
     $self->{chain}            = {};
     $self->{only_cache_chain} = {};
+    $self->{queue_name}       = $opts{queue} // $self->{queue};
 
     my $ret = eval {
 	$self->{orig_target} = $target;
 
-	return $self->value_ref_if_recomputed( $self->{orig_rule} = $self->find($target), $target );
+	return $self->value_ref_if_recomputed( $self->{orig_rule} = $self->find($target), $target, $only_from_cache );
     };
 
     my $terminated;
@@ -265,15 +331,14 @@ sub run {
     }
 
     if ( ! $ret->is_value ) {
-	$ret = $terminated ? $self->get_value( $target ) : $self->value_ref_if_recomputed( $self->{orig_rule}, $target, 1 );
-	if ( ! $ret->is_value ) {
+	return $self->get_value( $target )->bits( $ret->bits )
+	  if ( $terminated );
 
-	    # $self->target_remove($target);
-	    # warn "assertion: value for target '$target' should be in cache but none there";
-	}
+	return $self->_run( 1, $target, %opts )->bits( $ret->bits )
+	  if ! $only_from_cache;
     }
 
-    return $ret->value;
+    return $ret;
 }
 
 sub find {
