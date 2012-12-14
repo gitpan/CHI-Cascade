@@ -3,26 +3,44 @@ package CHI::Cascade::Value;
 use strict;
 use warnings;
 
-# value = undef				-> no in cache
-use constant CASCADE_NO_CACHE		=> 1 << 0;
+my %states = (
+    # value = undef			-> no in cache
+    CASCADE_NO_CACHE			=> 1 << 0,
 
-# value = undef | old_value		-> other process is computing this target or its any dependencies
-use constant CASCADE_COMPUTING		=> 1 << 1;
+    # value = undef | old_value		-> other process is computing this target or its any dependencies
+    CASCADE_COMPUTING			=> 1 << 1,
 
-# value = undef | old_value		-> this target is queued or any its dependencies are queued (only if 'run' is executed with 'queue' option)
-use constant CASCADE_QUEUED		=> 1 << 2;
+    # value = undef | old_value		-> recomputing is deferred
+    CASCADE_DEFERRED			=> 1 << 2,
 
-# value = old_value | actual_value	-> the value from cache (not computed now)
-use constant CASCADE_FROM_CACHE		=> 1 << 3;
+    # value = old_value | actual_value	-> the value from cache (not computed now)
+    CASCADE_FROM_CACHE			=> 1 << 3,
 
-# value = actual_value			-> this value is actual
-use constant CASCADE_ACTUAL_VALUE	=> 1 << 4;
+    # value = actual_value		-> this value is actual
+    CASCADE_ACTUAL_VALUE		=> 1 << 4,
 
-# value = actual_value & recomuted now	-> this value is recomputed right now
-use constant CASCADE_RECOMPUTED		=> 1 << 5;
+    # value = actual_value & recomuted now	-> this value is recomputed right now
+    CASCADE_RECOMPUTED			=> 1 << 5,
 
-# value = undef | old_value | value passed by exception -> code of target or code of any dependencies has raised an exception
-use constant CASCADE_CODE_EXCEPTION	=> 1 << 6;
+    # value = undef | old_value | value passed by exception -> code of target or code of any dependencies has raised an exception
+    CASCADE_CODE_EXCEPTION		=> 1 << 6,
+
+    # value = old_value | actual_value - value may be actual or not but actual term isn valid (only if 'run' is run with 'actual_term' option)
+    CASCADE_ACTUAL_TERM			=> 1 << 7,
+
+    # Some dependencies are affected for recomputing, but no recomputing now - only TTL period and value from cache
+    CASCADE_TTL_INVOLVED		=> 1 << 8
+);
+
+for ( keys %states ) {
+    no strict 'refs';
+    no warnings 'redefine';
+
+    my $bit = $states{$_};
+
+    *{ $_ } = sub () { $bit }
+}
+
 
 use parent 'Exporter';
 
@@ -30,7 +48,7 @@ use parent 'Exporter';
     no strict 'refs';
 
     our %EXPORT_TAGS = (
-	bits		=> [ map { "$_" } grep { /^CASCADE_/ && *{$_}{CODE} } keys %{ __PACKAGE__ . "::" } ]
+	state		=> [ map { "$_" } grep { /^CASCADE_/ && *{$_}{CODE} } keys %{ __PACKAGE__ . "::" } ]
     );
     Exporter::export_ok_tags( keys %EXPORT_TAGS );
 }
@@ -40,7 +58,7 @@ sub new {
 
     my $self = bless { %opts }, ref($class) || $class;
 
-    $self->{bits} ||= 0;
+    $self->{state} ||= 0;
 
     $self;
 }
@@ -49,24 +67,29 @@ sub is_value {
     shift->{is_value};
 }
 
-sub bits {
+sub state {
     my $self = shift;
 
     if (@_) {
-	$self->{bits} |= $_[0];
+	$self->{state} |= $_[0];
 	return $self;
     }
-    $self->{bits};
+    $self->{state};
 }
 
-sub recomputed {
-    my $self = shift;
+sub state_as_str {
+    my $state = $_[1];
 
-    if (@_) {
-	$self->{recomputed} = $_[0];
-	return $self;
+    return '' if ! $state;
+
+    my @names;
+
+    for ( keys %states ) {
+	push @names, $_
+	  if ( $state & $states{$_} );
     }
-    $self->{recomputed};
+
+    join( " | ", sort @names );
 }
 
 sub value {
@@ -148,6 +171,101 @@ First version returns a value, second sets a value and returns C<$value>.
     $value->is_value
 
 returns C<true> if value was set by L</value> method or C<false> else.
+
+=item state
+
+    use CHI::Cascade::Value ':state';
+    $state_bits = $value->state;
+    $value = $value->state( CASCADE_* );
+
+A getting or setting of state bits of value object.
+
+=item state_as_str
+
+    my $value = $cascade->run( 'my_target', state => \$state );
+    my $str = CHI::Cascade::Value->state_as_str( $state );
+
+Returns a string presentation of state bits (see below L</"STATE BITS">).
+Strings of bits are ordered by alphabetical before concatenation. Here some
+examples:
+
+    # It means you get actual value and this was recomputed right now
+    CASCADE_ACTUAL_VALUE | CASCADE_RECOMPUTED
+
+    # It happens when returned value of CHI::Cascade::run is undef and here is reason why:
+    # value right now is being computed in other process and no old value in cache
+    CASCADE_COMPUTING | CASCADE_NO_CACHE
+
+This method is useful for debugging or logging processes.
+
+=back
+
+=head1 STATE BITS
+
+Since version 0.26 the CHI::Cascade introduces the concept of state bits. An
+every value object (even which has not valid value) has a history is described
+by these state bits. To use this bit mask we can know how this value was gotten.
+These bits are returned by L<CHI::Cascade/run> in L<CHI::Cascade/state>
+variable.
+
+=over
+
+=item CASCADE_NO_CACHE
+
+A value of target was missed in cache. Only as information as value was fetched
+
+=item CASCADE_COMPUTING
+
+A value of target to be computing in other process. So L<CHI::Cascade/run> will
+return to you a B<undef> (if it misses in cache) or B<old value from cache>.
+
+=item CASCADE_DEFERRED
+
+A value of target should be recomputed but was not recomputed because
+L<CHI::Cascade/run> was executed with L<CHI::Cascade/defer> option as B<true>.
+This useful when you want to control an excution of codes of targets yourself.
+
+=item CASCADE_FROM_CACHE
+
+A value of target is B<old> or B<actual> value and was fetched from cache.
+
+=item CASCADE_ACTUAL_VALUE
+
+A value of target is B<actual> value (should not be recomputed)
+
+=item CASCADE_RECOMPUTED
+
+A value of target was recomputed by your request right now (was called
+L<CHI::Cascade/code> in your process)
+
+=item CASCADE_CODE_EXCEPTION
+
+A code of target or code of any dependencies has raised an exception. A value of
+target can be B<undef> (if L<CHI::Cascade/code> or any code of dependencies
+threw exception as not L<CHI::Cascade::Value> object or cache doesn't have any
+value of target, for example C<< die "some error" >>), B<old value from cache>
+(if L<CHI::Cascade/code> or any code of dependencies threw exception as
+L<CHI::Cascade::Value> object without value and cache has any value for target,
+for example C<< die CHI::Cascade::Value->new >>) or B<value was thrown by
+exception> (example: C<< die CHI::Cascade::Value->new(123) >> and even same: C<<
+die CHI::Cascade::Value->new(undef) >>)
+
+=item CASCADE_ACTUAL_TERM
+
+The method L<CHI::Cascade/run> was run with
+L<actual_term|CHI::Cascade/actual_term> option and C<actual term> is actual for
+this value (a value can be old - the CASCADE_ACTUAL_VALUE bit will not be set).
+
+=item CASCADE_TTL_INVOLVED
+
+A returned value is not actual value and already is old because some dependence
+is newly than value which depends from this. But you describes an option C<ttl>
+in L<CHI::Cascade/rule>. If you had passed the option C<ttl> like C<\$ttl> to
+L<CHI::Cascade/run> method there in $ttl will be fractal number of "time to
+live" - how many seconds are left before the computation (of course, if you will
+call C<run> again for that target). This feature is useful for global reset
+mechanism (one I<reset> target as global dependence and other rules from its
+have a C<ttl> parameter in I<rules>).
 
 =back
 

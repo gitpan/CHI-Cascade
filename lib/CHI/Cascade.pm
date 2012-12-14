@@ -3,13 +3,15 @@ package CHI::Cascade;
 use strict;
 use warnings;
 
-our $VERSION = 0.25001;
+our $VERSION = 0.26;
 
 use Carp;
 
-use CHI::Cascade::Value ':bits';
+use CHI::Cascade::Value ':state';
 use CHI::Cascade::Rule;
 use CHI::Cascade::Target;
+use Time::HiRes ();
+use POSIX ();
 
 sub new {
     my ($class, %opts) = @_;
@@ -19,16 +21,14 @@ sub new {
 	    plain_targets	=> {},
 	    qr_targets		=> [],
 	    target_locks	=> {},
-	    stats		=> { recompute => 0 }
+	    stats		=> { recompute => 0, run => 0, dependencies_lookup => 0 }
 
 	}, ref($class) || $class;
 
     $self->{target_chi} ||= $self->{chi};
-    $self->{queue_chi}  ||= $self->{target_chi};
 
     $self;
 }
-
 
 sub rule {
     my ($self, %opts) = @_;
@@ -46,11 +46,21 @@ sub rule {
     }
 }
 
-sub target_computing_or_queued {
+sub target_computing {
     my $trg_obj;
 
-    ($trg_obj = $_[0]->{target_chi}->get("t:$_[1]"))
-      ? ( $trg_obj->locked ? 1 : ( $_[0]->{queue_name} && $trg_obj->queued && 2 ) )
+    ( $trg_obj = $_[0]->{target_chi}->get("t:$_[1]") )
+      ? ( ( ${ $_[2] } = $trg_obj->ttl ), $trg_obj->locked ? 1 : 0 )
+      : 0;
+}
+
+sub target_is_actual {
+    my ( $self, $target, $actual_term ) = @_;
+
+    my $trg_obj;
+
+    ( $trg_obj = $self->{target_chi}->get("t:$target") )
+      ? $trg_obj->is_actual( $actual_term )
       : 0;
 }
 
@@ -59,7 +69,7 @@ sub target_time {
 
     my $trg_obj;
 
-    return ( ($trg_obj = $self->{target_chi}->get("t:$target"))
+    return ( ( $trg_obj = $self->{target_chi}->get("t:$target") )
       ? $trg_obj->time
       : 0
     );
@@ -70,15 +80,16 @@ sub get_value {
 
     my $value = $self->{chi}->get("v:$target");
 
-    return $value->bits( CASCADE_FROM_CACHE ) if ($value);
+    return $value->state( CASCADE_FROM_CACHE )
+      if ($value);
 
-    CHI::Cascade::Value->new( bits => CASCADE_NO_CACHE );
+    CHI::Cascade::Value->new( state => CASCADE_NO_CACHE );
 }
 
 sub target_lock {
-    my ($self, $rule) = @_;
+    my ( $self, $rule ) = @_;
 
-    my ($trg_obj, $target);
+    my ( $trg_obj, $target );
 
     # If target is already locked - a return
     return
@@ -93,16 +104,41 @@ sub target_lock {
 }
 
 sub target_unlock {
-    my ($self, $rule, $value) = @_;
+    my ( $self, $rule, $value ) = @_;
 
     my $target = $rule->target;
 
-    if ( my $trg_obj = $self->{target_chi}->get("t:$target") ) {
+    if ( my $trg_obj = $self->{target_chi}->get( "t:$target" ) ) {
 	$trg_obj->unlock;
-	$trg_obj->touch if $value && $value->recomputed;
-	$self->{target_chi}->set( "t:$target", $trg_obj, 'never' );
 
-	delete $self->{target_locks}{$target};
+	1 && $trg_obj->touch, $self->{run_opts}{actual_term} && $self->{orig_target} eq $target && $trg_obj->actual_stamp
+	  if ( $value && $value->state & CASCADE_RECOMPUTED );
+
+	$self->{target_chi}->set( "t:$target", $trg_obj, $rule->value_expires );
+    }
+
+    delete $self->{target_locks}{$target};
+}
+
+sub target_actual_stamp {
+    my ( $self, $rule, $value ) = @_;
+
+    my $target = $rule->target;
+
+    if ( $value && $value->state & CASCADE_ACTUAL_VALUE && ( my $trg_obj = $self->{target_chi}->get( "t:$target" ) ) ) {
+	$trg_obj->actual_stamp;
+	$self->{target_chi}->set( "t:$target", $trg_obj, $rule->value_expires );
+    }
+}
+
+sub target_start_ttl {
+    my ( $self, $rule, $start_time ) = @_;
+
+    my $target = $rule->target;
+
+    if ( my $trg_obj = $self->{target_chi}->get( "t:$target" ) ) {
+	$trg_obj->ttl( $rule->ttl, $start_time );
+	$self->{target_chi}->set( "t:$target", $trg_obj, $rule->value_expires );
     }
 }
 
@@ -125,62 +161,11 @@ sub target_locked {
     exists $_[0]->{target_locks}{$_[1]};
 }
 
-sub target_queue {
-    my $self = shift;
-
-    my $trg_obj;
-
-    $trg_obj = CHI::Cascade::Target->new unless $trg_obj = $self->{target_chi}->get("t:$self->{orig_target}");
-    $trg_obj->be_queued;
-    $self->{target_chi}->set( "t:$self->{orig_target}", $trg_obj, $trg_obj->locked ? $self->{orig_rule}{busy_lock} || $self->{busy_lock} || 'never' : 'never' );
-
-    my $queue;
-
-    $queue = [] unless $queue = $self->{queue_chi}->get("q:$self->{queue_name}");
-    push @$queue, $self->{orig_target};
-    $self->{queue_chi}->set( "q:$self->{queue_name}", $queue, 'never' );
-}
-
-sub target_not_queued {
-    my ( $self, $target ) = @_;
-
-    my $trg_obj;
-
-    if ( $trg_obj = $self->{target_chi}->get("t:$target") ) {
-	$trg_obj->not_queued;
-        $self->{target_chi}->set( "t:$target", $trg_obj, 'never' );
-    }
-}
-
-sub queue {
-    my ( $self, $queue_name ) = @_;
-
-    my ( $queue, $run_target );
-
-    if ( ( $queue = $self->{queue_chi}->get("q:$queue_name") ) && @$queue ) {
-	eval { $self->run( $run_target = $queue->[0] ) };
-
-	my $error = $@;
-
-	$self->target_not_queued( $queue->[0] );
-	$self->{queue_chi}->set( "q:$queue_name", $queue, 'never' )
-	  if ( ( $queue = $self->{queue_chi}->get("q:$queue_name") ) && $queue->[0] eq $run_target && shift @$queue );
-
-	die $error if $error;
-	return 1;
-    }
-
-    return 0;
-}
-
 sub recompute {
     my ( $self, $rule, $target, $dep_values) = @_;
 
-    if ( $self->{queue_name} ) {
-	# If run methos was run with 'queue' option - to prevent here any recomputing
-	$self->target_queue;
-	die CHI::Cascade::Value->new( bits => CASCADE_QUEUED );
-    }
+    die CHI::Cascade::Value->new( state => CASCADE_DEFERRED )
+      if $self->{run_opts}{defer};
 
     my $ret = eval { $rule->{code}->( $rule, $target, $rule->{dep_values} = $dep_values ) };
 
@@ -193,9 +178,13 @@ sub recompute {
 
     my $value;
 
+    # For performance a value should not expire in anyway (only target marker if need)
     $self->{chi}->set( "v:$target", $value = CHI::Cascade::Value->new->value($ret), 'never' );
-    $value->recomputed(1)->bits( CASCADE_ACTUAL_VALUE | CASCADE_RECOMPUTED );
-    $rule->{recomputed}->( $rule, $target, $value ) if ( ref $rule->{recomputed} eq 'CODE' );
+
+    $value->state( CASCADE_ACTUAL_VALUE | CASCADE_RECOMPUTED );
+
+    $rule->{recomputed}->( $rule, $target, $value )
+      if ( ref $rule->{recomputed} eq 'CODE' );
 
     return $value;
 }
@@ -207,10 +196,12 @@ sub value_ref_if_recomputed {
 
     my @qr_params = $rule->qr_params;
 
-    if ( my $ret = $self->target_computing_or_queued($target) ) {
-	# If we have any target as a being computed (dependencie/original) or queued if need
+    my ( $ret_state, $ttl, $ttl_recompute ) = ( CASCADE_ACTUAL_VALUE );
+
+    if ( $self->target_computing( $target, \$ttl ) ) {
+	# If we have any target as a being computed (dependencie/original)
 	# there is no need to compute anything - trying to return original target value
-	die CHI::Cascade::Value->new->bits( $ret == 1 ? CASCADE_COMPUTING : CASCADE_QUEUED );
+	die CHI::Cascade::Value->new->state( CASCADE_COMPUTING );
     }
 
     my ( %dep_values, $dep_name );
@@ -220,11 +211,14 @@ sub value_ref_if_recomputed {
 	# Trying to get value from cache
 	my $value = $self->get_value($target);
 
-	return $value if $value->is_value;
+	return $value
+	  if $value->is_value;
 
 	# If no in cache - we should recompute it again
 	$self->target_lock($rule);
     }
+
+    push @{ $self->{target_stack} }, $target;
 
     my $ret = eval {
 	my $dep_target;
@@ -249,25 +243,52 @@ sub value_ref_if_recomputed {
 	    return $ret;
 	};
 
-	foreach my $depend (@{ $rule->depends }) {
-	    $dep_target = ref($depend) eq 'CODE' ? $depend->( $rule, @qr_params ) : $depend;
+	$self->target_lock($rule)
+	  if ! $self->target_time($target);
 
-	    $dep_values{$dep_target}->[0] = $self->find($dep_target);
+	$ttl_recompute = $self->target_locked($target);
 
-	    die qq{Found circle dependencies ( target '$target' <--> '$dep_target' ) - aborted!"}
-	      if ( exists $self->{ $only_from_cache ? 'only_cache_chain' : 'chain' }{$target}{$dep_target} );
-
-	    $self->{ $only_from_cache ? 'only_cache_chain' : 'chain' }{$target}{$dep_target} = 1;
-
-	    $catcher->( sub {
-		$self->target_lock($rule)
-		  if (   ! $only_from_cache
-		      && ( ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target ) )->recomputed
-		      || ( $self->target_time($dep_target) > $self->target_time($target) ) ) );
-	    } );
+	if ( defined $ttl && $ttl > 0 && ! $ttl_recompute ) {
+	    $ret_state = CASCADE_TTL_INVOLVED;
+	    $self->{ttl} = $ttl;
 	}
+	else {
+	    my ( $rule_ttl, $circle_hash, $start_time, $ret ) = ( $rule->ttl, $only_from_cache ? 'only_cache_chain' : 'chain' );
 
-	$self->target_lock($rule) if ! $self->target_time($target);
+	    foreach my $depend (@{ $rule->depends }) {
+		$dep_target = ref($depend) eq 'CODE' ? $depend->( $rule, @qr_params ) : $depend;
+
+		$dep_values{$dep_target}->[0] = $self->find($dep_target);
+
+		die "Found circle dependencies (trace: " . join( '->', @{ $self->{target_stack} }, $dep_target ) . ") - aborted!"
+		  if ( exists $self->{ $circle_hash }{$target}{$dep_target} );
+
+		$self->{ $circle_hash }{$target}{$dep_target} = 1;
+
+		$ret = $catcher->( sub {
+		    if (   ! $only_from_cache
+			&& ( $start_time = ( $self->{stats}{dependencies_lookup}++,
+			     ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target ) )->state & CASCADE_RECOMPUTED && Time::HiRes::time
+			|| ( $start_time = $self->target_time($dep_target) ) > $self->target_time($target) && $start_time ) ) )
+		    {
+			if ( defined $rule_ttl && $rule_ttl > 0 && ! defined $ttl && ! $ttl_recompute && ( $start_time + $rule_ttl ) > Time::HiRes::time ) {
+			    $self->target_start_ttl( $rule, $start_time );
+			    $ret_state = CASCADE_TTL_INVOLVED;
+			    $self->{ttl} = $start_time + $rule_ttl - Time::HiRes::time;
+			    return 1;
+			}
+			else {
+			    $self->target_lock($rule);
+			    return 0;
+			}
+		    }
+		} );
+
+		delete $self->{ $circle_hash }{$target}{$dep_target};
+
+		last if $ret == 1;
+	    }
+	}
 
 	if ( $self->target_locked($target) ) {
 	    # We should recompute this target
@@ -276,6 +297,7 @@ sub value_ref_if_recomputed {
 		if (   ! defined $dep_values{$dep_target}->[1]
 		    || ! $dep_values{$dep_target}->[1]->is_value )
 		{
+		    $self->{stats}{dependencies_lookup}++;
 		    $catcher->( sub {
 			if ( ! ( $dep_values{$dep_target}->[1] = $self->value_ref_if_recomputed( $dep_values{$dep_target}->[0], $dep_target, 1 ) )->is_value ) {
 			    $self->target_remove($dep_target);
@@ -290,37 +312,71 @@ sub value_ref_if_recomputed {
 	return $self->recompute( $rule, $target, { map { $_ => $dep_values{$_}->[1]->value } keys %dep_values } )
 	  if $self->target_locked($target);
 
-	return CHI::Cascade::Value->new( bits => CASCADE_ACTUAL_VALUE );
+	return CHI::Cascade::Value->new( state => $ret_state );
     };
 
+    pop @{ $self->{target_stack} };
+
     my $e = $@;
-    $self->target_unlock($rule, $ret)
-      if $self->target_locked($target);
+
+    if ( $self->target_locked($target) ) {
+	$self->target_unlock( $rule, $ret );
+    }
+    elsif ( $self->{run_opts}{actual_term} && ! $only_from_cache && $self->{orig_target} eq $target ) {
+	$self->target_actual_stamp( $rule, $ret );
+    }
+
     die $e if $e;
 
     return $ret || CHI::Cascade::Value->new;
 }
 
+sub stash { exists $_[0]->{stash} && $_[0]->{stash} || die "The stash method from outside run method!" }
+
 sub run {
     my ( $self, $target, %opts ) = @_;
 
-    my $res = $self->_run( 0, $target, %opts );
+    my $view_dependencies = 1;
 
-    ${ $opts{bits} } = $res->bits
-      if ( $opts{bits} );
+    $self->{run_opts}    = \%opts;
+    $self->{ttl}         = undef;
+    $opts{actual_term} ||= $self->find($target)->{actual_term};
+    $self->{stats}{run}++;
+
+    $self->{stash} = $opts{stash} && ref $opts{stash} eq 'HASH' && $opts{stash} || {};
+
+    $view_dependencies = ! $self->target_is_actual( $target, $opts{actual_term} )
+      if ( $opts{actual_term} );
+
+    my $res = $self->_run( ! $view_dependencies, $target );
+
+    $res->state( CASCADE_ACTUAL_TERM )
+      if ( $opts{actual_term} && ! $view_dependencies );
+
+    if ( defined $self->{ttl} && $self->{ttl} > 0 ) {
+	$res->state( CASCADE_TTL_INVOLVED );
+    }
+
+    ${ $opts{ttl} } = $self->{ttl}
+      if ( $opts{ttl} );
+
+    ${ $opts{state} } = $res->state
+      if ( $opts{state} );
+
+    delete $self->{stash};
 
     $res->value;
 }
 
 sub _run {
-    my ( $self, $only_from_cache, $target, %opts ) = @_;
+    my ( $self, $only_from_cache, $target ) = @_;
 
     croak qq{The target ($target) for run should be string} if ref($target);
     croak qq{The target for run is empty} if $target eq '';
 
     $self->{chain}            = {};
     $self->{only_cache_chain} = {};
-    $self->{queue_name}       = defined( $opts{queue} ) ?  $opts{queue} : $self->{queue};
+    $self->{target_stack}     = [];
 
     my $ret = eval {
 	$self->{orig_target} = $target;
@@ -336,17 +392,17 @@ sub _run {
 	die $ret
 	  unless eval { $ret->isa('CHI::Cascade::Value') };
 
-	$ret->bits( CASCADE_CODE_EXCEPTION )
-	  unless $ret->bits;
+	$ret->state( CASCADE_CODE_EXCEPTION )
+	  unless $ret->state;
     }
 
     if ( ! $ret->is_value ) {
         my $from_cache = $self->get_value( $target );
 
-	return $from_cache->bits( $ret->bits )
+	return $from_cache->state( $ret->state )
 	  if ( $terminated || $from_cache->is_value );
 
-	return $self->_run( 1, $target, %opts )
+	return $self->_run( 1, $target )
 	  if ! $only_from_cache;
     }
 
@@ -438,8 +494,9 @@ CHI::Cascade - a cache dependencies (cache and like 'make' utility concept)
 =head1 DESCRIPTION
 
 This module is the attempt to use a benefits of caching and 'make' concept.
-If we have many an expensive tasks and want to cache it we can split its
-to small expsnsive tasks and to describe dependencies for cache items.
+If we have many an expensive tasks (a I<computations> or sometimes here used
+term as a I<recomputing>) and want to cache it we can split its to small
+expsnsive tasks and to describe dependencies for cache items.
 
 This module is experimental yet. I plan to improve it near time but some things
 already work. You can take a look for t/* tests as examples.
@@ -456,21 +513,21 @@ Options are:
 
 =item chi
 
-Required. Instance of L<CHI> object. The L<CHI::Cascade> doesn't construct this
+B<Required>. Instance of L<CHI> object. The L<CHI::Cascade> doesn't construct this
 object for you. Please create instance of C<CHI> yourself.
 
 =item busy_lock
 
-Optional. Default is I<never>. I<This is not C<busy_lock> option of CHI!> This
-is amount of time (to see L<CHI/"DURATION EXPRESSIONS">) until all target locks
-expire. When a target is recomputed it is locked. If process is to be
-recomputing target and it will die or OS will be hangs up we can dead locks and
-locked target will never recomputed again. This option helps to avoid it. You
-can set up a special busy_lock for rules too.
+B<Optional>. Default is I<never>. I<This is not C<busy_lock> option of CHI!>
+This is amount of time (to see L<CHI/"DURATION EXPRESSIONS">) until all target
+locks expire. When a target is to being computing it is locked. If process which
+is to be computing target and it will die or OS will be hangs up we can dead
+locks and locked target will never recomputed again. This option helps to avoid
+it. You can set up a special busy_lock for rules too.
 
 =item target_chi
 
-Optional. This is CHI cache for target markers. Default value is value of
+B<Optional>. This is CHI cache for target markers. Default value is value of
 L</chi> option. It can be useful if you use a L<CHI/l1_cache> option. So you can
 separate data of targets from target markers - data will be kept in a file cache
 and a marker in memory cache for example.
@@ -486,18 +543,18 @@ and a marker in memory cache for example.
 To add new rule to C<CHI::Cascade> object. All rules should be added before
 first L</run> method
 
-The keys of %options are:
+The keys of %options are (options are passed directly in L<CHI::Cascade::Rule> constructor):
 
 =over
 
 =item target
 
-B<Required.> A target for L</run> and for searching of L</depends>. It can be as
+B<Required>. A target for L</run> and for searching of L</depends>. It can be as
 scalar text or C<Regexp> object created through C<qr//>
 
 =item depends
 
-B<Optional.> The B<scalar>, B<arrayref> or B<coderef> values of dependencies.
+B<Optional>. The B<scalar>, B<arrayref> or B<coderef> values of dependencies.
 This is the definition of target(s) from which this current rule is dependent.
 If I<depends> is:
 
@@ -531,7 +588,7 @@ this paragraph.
 
 =item depends_catch
 
-B<Optional.> This is B<coderef> for dependence exceptions. If any dependence
+B<Optional>. This is B<coderef> for dependence exceptions. If any dependence
 from list of L</depends>'s option throws an exception of type
 CHI::Cascade::Value by C<die> (for example like this code: C<< die
 CHI::Cascade::Value->new->value( { i_have_problem => 1 } ) >> ) then the
@@ -569,8 +626,8 @@ dependencies before execution of dependent code.
 
 =item code
 
-B<Required.> The code reference for computing a value of this target (a
-recompute code). Will be executed if no value in cache for this target or
+B<Required>. The code reference for computing a value of this target (a
+I<computational code>). Will be executed if no value in cache for this target or
 any dependence or dependences of dependences and so on will be recomputed. Will
 be executed as C<< $code->( $rule, $target, $hashref_to_value_of_dependencies )
 >> I<(The API of running this code was changed since v0.10)>
@@ -582,6 +639,10 @@ value or cannot (a valid value can be even C<undef>!). A L</run> method returns
 either a value is set by you (through L<CHI::Cascade::Value/value> method) or
 value from cache or C<undef> in other cases. Please to see
 L<CHI::Cascade::Value>
+
+If L</run> method will have a L</defer> option as B<true> this code will not be
+executed and you will get a set bit B<CASCADE_DEFERRED> in L</state> bit mask
+variable. This may useful when you want to control a target execution.
 
 =over
 
@@ -611,25 +672,25 @@ last will not be executed (The C<run> will return C<undef>).
 
 =item params
 
-You can pass in your code any additional parameters by this option. These
-parameters are accessed in your code through L<CHI::Cascade::Rule/params>
-method of L<CHI::Cascade::Rule> instance object.
+B<Optional>. You can pass in your code any additional parameters by this option.
+These parameters are accessed in your rule's code through
+L<CHI::Cascade::Rule/params> method of L<CHI::Cascade::Rule> instance object.
 
 =item busy_lock
 
-Optional. Default is L</busy_lock> of constructor or I<never> if first is not
+B<Optional>. Default is L</busy_lock> of constructor or I<never> if first is not
 defined. I<This is not C<busy_lock> option of CHI!> This is amount of time (to
 see L<CHI/"DURATION EXPRESSIONS">) until target lock expires. When a target is
-recomputed it is locked. If process is to be recomputing target and it will die
-or OS will be hangs up we can dead locks and locked target will never recomputed
-again. This option helps to avoid it.
+to being computed it is locked. If process which to be recomputing a target and
+it will die or OS will be hangs up we can dead locks and locked target will
+never recomputed again. This option helps to avoid it.
 
 =item recomputed
 
-Optional. This is a recomputed callback (coderef). If target of this rule was
-recomputed this callback will be executed right away after recomputed value has
-been saved in cache. The callback will be executed as $coderef->( $rule,
-$target, $value ) where are:
+B<Optional>. This is a computational callback (coderef). If target of this rule
+was recomputed this callback will be executed right away after a recomputed
+value has been saved in cache. The callback will be executed as $coderef->(
+$rule, $target, $value ) where passed parameters are:
 
 =over
 
@@ -644,7 +705,7 @@ A current target as string
 
 =item $value
 
-The instance of L<CHI::Cascade::Value> class. You can use a recomputed value as
+The instance of L<CHI::Cascade::Value> class. You can use a computed value as
 $value->value
 
 =back
@@ -652,14 +713,117 @@ $value->value
 For example you can use this callback for notifying of other sites that your
 target's value has been changed and is already in cache.
 
+=item value_expires
+
+B<Optional>.
+Sets an expire value for all future target markers are created by this rule in
+notation described in L<CHI/"DURATION EXPRESSIONS">. The B<default> is 'never'.
+
+=item ttl
+
+B<Optional>.
+An arrayref for min & max intervals of TTL. Example: C<[ 60, 3600 ]> - where the
+minimum ttl is seconds and the maximum is 3600 seconds. Targets of this rule
+will be recomputed during from 60 up to 3600 seconds from touched time of any
+dependence this rule. Please read L<CHI::Cascade::Value/CASCADE_TTL_INVOLVED>
+too.
+
 =back
 
-=item run( $target )
+=item run( $target, %options )
 
-This method makes a cascade computing if need and returns value (value is
+This method makes a cascade computation if need and returns value (value is
 cleaned value not L<CHI::Cascade::Value> object!) for this target If any
-dependence of this target of any dependencies of dependencies were recomputed
-this target will be recomputed too.
+dependence of this target of any dependencies of dependencies were
+(re)computed this target will be (re)computed too.
+
+=over
+
+=item $target
+
+B<Required.> Plain text string of target.
+
+=item %options
+
+B<Optional.> And B<all options> are B<optional> too A hash of options. Valid keys and values are:
+
+=over
+
+=item state
+
+A B<scalarref> of variable where will be stored a state of L</run>. Value will
+be a bit mask.
+
+=item defer
+
+If value will be a B<true> then computational code will not be run if there is a
+need. After L</run> you can test status of returned value - it should be
+(re)computed or not by bit C<CASCADE_DEFERRED> in saved L</state> variable. If
+the B<CASCADE_DEFERRED> bit is set you can recall L</run> method again or
+re-execute target in other process for a non-blocking execution of current
+process.
+
+=item actual_term
+
+The value in seconds (a floating point value) of actual term. The actual term is
+period when dependencies to be checked for $target in L</run> method. If this
+option is not defined then the L</run> method checks a dependencies of $target
+every time in runtime. But sometimes (when a target has many dependencies) we
+could want to reduce an amount of dependencies checks. For example if
+C<actual_term> will be defined as C<2.5> this will mean to check a dependencies
+only every 2.5 seconds. So recomputing in this example can be recomputed only
+one time in every 2.5 seconds (even if one from dependencies will be updated).
+But if value of $target is missing in cache a recomputing can be
+run regardless of this option.
+
+=item ttl
+
+A B<scalarref> for getting current TTL for value of 'run' target. The TTL is
+"time to live" as TTL in DNS. If any rule in a path of following to dependencies
+has ttl parameter then the cascade will do there:
+
+=over
+
+=item 1.
+
+will look up a time of this retouched dependence;
+
+=item 2.
+
+if rule's target marker already has a upper time and this time in future
+the target will be recomputed in this time in future and before this moment you
+will get a old data from cache for 'run' target. If this time is there and has
+elapsed cascade will use a standard algorithm.
+
+=item 3.
+
+will look up the rule's ttl parameter (min & max ttl values) and will generate
+upper time of computation of this rule's target and will return from L</run>
+method old data of 'run' target. Next L</run>s executions will return old values
+of any targets where this TTL-marked target is as dependence.
+
+=item 4.
+
+In any case if old value misses in cache the cascade will recompute codes.
+
+=back
+
+This feature was made for I<reset> situation. For example if we have 'reset'
+rule and all rules depend from this one rule the better way will be to have
+'ttl' parameter in every rule except 'reset' rule. So if rule 'reset' will be
+retouched (or deleted) other targets will be recomputed during time from 'min'
+and 'max' intervals from 'reset' touched time. It reduce a server's load. Later
+i will add examples for this and will document this feature more details. Please
+read L<CHI::Cascade::Value/CASCADE_TTL_INVOLVED> too.
+
+=item stash
+
+A I<hashref> to stash - temporary data container between rule's codes. Please
+see L</"stash ()"> method for details.
+
+=back
+
+=back
 
 =item touch( $target )
 
@@ -674,6 +838,22 @@ It's like a removing of target file in make. You can force to recompute target
 by this method. It will remove target marker if one exists and once when cascade
 will need target value it will be recomputed. In a during recomputing of course
 cascade will return an old value if one exists in cache.
+
+=item stash ()
+
+It returns I<hashref> to a stash. A stash is hash for temporary data between
+rule's codes. It can be used only from inside L</run>. Example:
+
+    $cascade->run( 'target', stash => { key1 => value1 } )
+
+and into rule's code:
+
+    $rule->cascade->stash->{key1}
+
+If a L</run> method didn't get stash hashref the default stash will be as empty
+hash. You can pass a data between rule's codes but it's recommended only in
+special cases. For example when run's target cannot get a full data from its
+target's name.
 
 =back
 

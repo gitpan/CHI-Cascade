@@ -30,20 +30,27 @@ sub time {
 
 sub touch {
     $_[0]->{time} = Time::HiRes::time;
-    $_[0]->not_queued;
+    delete $_[0]->{finish_time};
 }
 
-sub be_queued {
-    $_[0]->{queued} = 1;
+sub actual_stamp {
+    $_[0]->{actual_stamp} = Time::HiRes::time;
 }
 
-sub queued {
-    exists $_[0]->{queued}
-      and $_[0]->{queued};
+sub is_actual {
+    ( $_[0]->{actual_stamp} || $_[0]->{time} || 0 ) + $_[1] >= Time::HiRes::time;
 }
 
-sub not_queued {
-    delete $_[0]->{queued};
+sub ttl {
+    my $self = shift;
+
+    if (@_) {
+	$self->{finish_time} = ( $_[1] || Time::HiRes::time ) + $_[0];
+	return $self;
+    }
+    else {
+	return $self->{finish_time} ? $self->{finish_time} - Time::HiRes::time : undef;
+    }
 }
 
 1;

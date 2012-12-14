@@ -6,13 +6,16 @@ use CHI::Cascade;
 
 use IO::Handle;
 use Storable	qw(store_fd fd_retrieve);
-use Time::HiRes	qw(sleep alarm time);
+use Time::HiRes	qw(time);
 
 use constant DELAY		=> 2.0;
 use constant QUICK_DELAY	=> 0.5;
 
 plan skip_all => 'Not installed CHI::Driver::Memcached::Fast'
   unless eval "use CHI::Driver::Memcached::Fast; 1";
+
+plan skip_all => 'Memcached tests are skipped (to define FORCE_MEMCACHED_TESTS environment variable if you want)'
+  unless defined $ENV{FORCE_MEMCACHED_TESTS};
 
 my ($pid_file, $socket_file, $cwd, $user_opt);
 
@@ -42,7 +45,7 @@ $SIG{__DIE__} = sub {
 
 $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { die "Terminated by " . shift };
 
-sleep 1;
+select( undef, undef, undef, 1.0 );
 
 if ( $? || ! (-f $pid_file )) {
     ( defined($out) && chomp($out) ) || ( $out = '' );
@@ -262,10 +265,9 @@ sub set_cascade_rules {
 	target		=> 'big_array',
 	depends		=> 'big_array_trigger',
 	code		=> sub {
-	    if ($delay) {
-		alarm(0);
-		sleep $delay;
-	    }
+	    select( undef, undef, undef, $delay )
+	      if ($delay);
+
 	    return $big_array_type ? [ 101 .. 1000 ] : [ 1 .. 1000 ];
 	}
     );
@@ -278,10 +280,9 @@ sub set_cascade_rules {
 
 	    my ($page) = $target =~ /^one_page_(\d+)$/;
 
-	    if ($delay) {
-		alarm(0);
-		sleep $delay;
-	    }
+	    select( undef, undef, undef, $delay )
+	      if ($delay);
+
 	    my $ret = [ @{$values->{big_array}}[ ($page * 10) .. (( $page + 1 ) * 10 - 1) ] ];
 	    $ret;
 	}

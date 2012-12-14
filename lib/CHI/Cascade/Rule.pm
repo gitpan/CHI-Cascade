@@ -10,13 +10,14 @@ sub new {
 
     my $from = ref($class) ? $class : \%opts;
 
-    $opts{depends} = [ defined( $opts{depends} ) ? ( $opts{depends} ) : () ] unless ref( $opts{depends} );
+    $opts{depends} = [ defined( $opts{depends} ) ? ( $opts{depends} ) : () ]
+      unless ref( $opts{depends} );
 
     # To do clone or new object
     my $self = bless {
 	map( { $_ => $from->{$_} }
 	  grep { exists $from->{$_} }
-	  qw( target depends depends_catch code params busy_lock cascade recomputed )),
+	  qw( target depends depends_catch code params busy_lock cascade recomputed actual_term ttl value_expires ) ),
 	qr_params	=> [],
 	matched_target	=> undef
     }, ref($class) || $class;
@@ -49,6 +50,34 @@ sub depends {
     return $self->{depends};
 }
 
+sub value_expires {
+    my $self = shift;
+
+    if (@_) {
+	$self->{value_expires} = $_[0];
+	return $self;
+    }
+    $self->{value_expires} || 'never';
+}
+
+sub ttl {
+    my $self = shift;
+
+    return undef
+      unless exists $self->{ttl};
+
+    $self->{ttl_time} && return $self->{ttl_time};
+
+    if ( ref $self->{ttl} eq 'ARRAY' && @{ $self->{ttl} } == 2 ) {
+	return $self->{ttl_time} = rand( $self->{ttl}[1] - $self->{ttl}[0] ) + $self->{ttl}[0];
+    }
+    elsif ( ref $self->{ttl} eq 'CODE' ) {
+	return $self->{ttl_time} = $self->{ttl}->( $self, $self->qr_params );
+    }
+
+    return undef;
+}
+
 sub target	{ shift->{matched_target}	}
 sub params	{ shift->{params}		}
 sub cascade	{ shift->{cascade}		}
@@ -69,7 +98,7 @@ CHI::Cascade::Rule - a rule class
 	code	=> sub {
 	    my ( $rule, $target, $dep_values ) = @_;
 
-	    # For executino of $cascade->run('target_12') will be:
+	    # An execution of $cascade->run('target_12') will pass in code a $rule as:
 	    #
 	    # $rule->target	eq	$target
 	    # $rule->depends	===	[ 'base_target' ]
@@ -83,7 +112,18 @@ CHI::Cascade::Rule - a rule class
 
 =head1 CONSTRUCTOR
 
-An instance of this object is created by L<CHI::Cascade> in L<CHI::Cascade/rule>.
+An instance of this object is created by L<CHI::Cascade> in L<CHI::Cascade/rule>
+as a following:
+
+    $rule = CHI::Cascade::Rule->new( %options )
+
+The list of options please see in L<CHI::Cascade/"rule( %options )"> method.
+
+=over
+
+=item
+
+=back
 
 =head1 DESCRIPTION
 
@@ -99,7 +139,7 @@ to some parameters of your currect executed target.
 
 =item qr_params
 
-returns a list. Is used for getting a result of C<=~> operation if target is
+returns a list. It is used for getting a result of C<=~> operation if target is
 described for L<rule|CHI::Cascade/rule> through C<qr//> operator.
 
 =item depends
@@ -121,6 +161,13 @@ returns any data of any type what were passed to L<CHI::Cascade/params>
 =item cascade
 
 returns reference to L<CHI::Cascade> instance object for this rule.
+
+=item value_expires
+
+Sets an expire value of target marker in notation described in
+L<CHI/"DURATION EXPRESSIONS">. The B<default> is 'never'. You can use this
+method inside L<CHI::Cascade/code> and L<CHI::Cascade/recomputed> your callbacks
+if you want to force recomputing of current target through minimum this time.
 
 =back
 

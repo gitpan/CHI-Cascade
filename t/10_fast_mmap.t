@@ -1,7 +1,7 @@
 use strict;
 
 use lib 't/lib';
-use test_01;
+use test_07;
 
 use Test::More;
 
@@ -10,8 +10,6 @@ use CHI::Cascade;
 
 plan skip_all => "Not installed CHI::Driver::FastMmap ($@)"
   unless eval "use CHI::Driver::FastMmap; 1";
-
-plan tests => 32;
 
 $SIG{__DIE__} = sub {
     `{ rm -rf t/fast_mmap; } >/dev/null 2>&1`;

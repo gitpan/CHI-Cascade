@@ -13,6 +13,8 @@ my $recomputed;
 sub test_cascade {
     my $cascade = shift;
 
+    plan tests => 12;
+
     $cascade->rule(
 	target		=> 'big_array',
 	code		=> sub {
@@ -36,33 +38,37 @@ sub test_cascade {
 	recomputed	=> sub { $recomputed++ }
     );
 
-    ok( $cascade->{stats}{recompute} == 0, 'recompute stats - 1');
+    my ( $state );
 
     my $time1 = time;
-    ok( ! defined $cascade->run( 'one_page_0', queue => 'test' ), '0th page, queued');
+    ok( ! defined $cascade->run( 'one_page_0',
+	defer => 1,
+	state => \$state )
+    );
     my $time2 = time;
 
-    ok( $cascade->{stats}{recompute} == 0, 'recompute stats - 2');
-    ok( $time2 - $time1 < 0.1, 'time of 1st starting' );
+    ok( $cascade->{stats}{recompute} == 0 );
+    ok( $time2 - $time1 < 0.1 );
+    ok( CHI::Cascade::Value->state_as_str($state) eq "CASCADE_DEFERRED | CASCADE_NO_CACHE" );
 
     my $res;
 
     $time1 = time;
-    ok ( $cascade->queue('test') == 1, '1st queue run' );
+    ok( defined( $res = $cascade->run( 'one_page_0', state => \$state ) ) );
     $time2 = time;
-    ok( $time2 - $time1 > 0.9 && $time2 - $time1 < 1.1, 'time of queue' );
-
-    ok( defined( $res = $cascade->run( 'one_page_0', queue => 'test' ) ), '0th page, queued but recomputed already');
+    ok( $time2 - $time1 > 0.8 && $time2 - $time1 < 1.2 );
     is_deeply( $res, [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ] );
+    ok( CHI::Cascade::Value->state_as_str($state) eq "CASCADE_ACTUAL_VALUE | CASCADE_RECOMPUTED" );
 
-    ok ( $cascade->queue('test') == 0, 'second queue run' );
-
-    ok( defined( $res = $cascade->run( 'one_page_1' ) ), '1th page, not queued' );
-    is_deeply( $res, [ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 ], 'result of 1st page' );
-
-    ok( defined( $res = $cascade->run( 'one_page_1', queue => 'test' ) ), '1th page, queued' );
-    is_deeply( $res, [ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 ], 'result of 1st page' );
-    ok ( $cascade->queue('test') == 0, '3rd queue run' );
+    $time1 = time;
+    ok( defined $cascade->run( 'one_page_0',
+	defer => 1,
+	state => \$state )
+    );
+    $time2 = time;
+    ok( $time2 - $time1 < 0.1 );
+    is_deeply( $res, [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ] );
+    ok( CHI::Cascade::Value->state_as_str($state) eq "CASCADE_ACTUAL_VALUE | CASCADE_FROM_CACHE" );
 }
 
 1;

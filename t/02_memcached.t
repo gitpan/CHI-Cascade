@@ -11,6 +11,9 @@ use CHI::Cascade;
 plan skip_all => 'Not installed CHI::Driver::Memcached::Fast'
   unless eval "use CHI::Driver::Memcached::Fast; 1";
 
+plan skip_all => 'Memcached tests are skipped (to define FORCE_MEMCACHED_TESTS environment variable if you want)'
+  unless defined $ENV{FORCE_MEMCACHED_TESTS};
+
 my ($pid_file, $socket_file, $cwd, $user_opt);
 
 chomp($cwd = `pwd`);
@@ -46,7 +49,7 @@ if ( $? || ! (-f $pid_file )) {
     plan skip_all => "Cannot start the memcached for this test ($out)";
 }
 else {
-    plan tests => 15;
+    plan tests => 32;
 }
 
 my $cascade = CHI::Cascade->new(
