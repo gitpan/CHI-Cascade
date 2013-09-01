@@ -4,7 +4,7 @@
       "Perlover <perlover@perlover.com>"
    ],
    "dynamic_config" : 0,
-   "generated_by" : "ExtUtils::MakeMaker version 6.6302, CPAN::Meta::Converter version 2.120630",
+   "generated_by" : "Module::Install version 1.06, CPAN::Meta::Converter version 2.112621",
    "license" : [
       "perl_5"
    ],
@@ -15,33 +15,42 @@
    "name" : "CHI-Cascade",
    "no_index" : {
       "directory" : [
-         "t",
-         "inc"
+         "inc",
+         "t"
       ]
    },
    "prereqs" : {
       "build" : {
          "requires" : {
             "ExtUtils::MakeMaker" : "6.36",
-            "Storable" : "0",
-            "Test::Base" : "0",
-            "Test::More" : "0"
+            "Storable" : 0,
+            "Test::Base" : 0,
+            "Test::More" : 0
          }
       },
       "configure" : {
          "requires" : {
-            "ExtUtils::MakeMaker" : "0"
+            "ExtUtils::MakeMaker" : "6.36"
          }
       },
       "runtime" : {
          "requires" : {
-            "CHI" : "0",
-            "Scalar::Util" : "0",
-            "Time::HiRes" : "0",
-            "parent" : "0"
+            "CHI" : 0,
+            "Scalar::Util" : 0,
+            "Time::HiRes" : 0,
+            "parent" : 0
          }
       }
    },
    "release_status" : "stable",
-   "version" : "0.261"
+   "resources" : {
+      "license" : [
+         "http://dev.perl.org/licenses/"
+      ],
+      "repository" : {
+         "type" : "git",
+         "url" : "git://github.com/Perlover/CHI-Cascade.git"
+      }
+   },
+   "version" : "0.27"
 }
