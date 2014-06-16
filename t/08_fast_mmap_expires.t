@@ -1,7 +1,7 @@
 use strict;
 
 use lib 't/lib';
-use test_06;
+use test_05_expires;
 
 use Test::More;
 

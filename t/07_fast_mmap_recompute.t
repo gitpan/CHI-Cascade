@@ -1,7 +1,7 @@
 use strict;
 
 use lib 't/lib';
-use test_04;
+use test_04_recompute;
 
 use Test::More;
 
